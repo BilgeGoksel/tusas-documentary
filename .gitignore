@@ -13,12 +13,14 @@ venv/
 # User documents and generated data
 data/uploads/*
 !data/uploads/.gitkeep
+data/processed/*
 data/chroma/*
 !data/chroma/.gitkeep
 tests/.tmp_uploads/
 tests/.tmp_pytest/
 tests/tmp_pytest/
 tests/tmp_uploads/
+tests/tmp_pdfs/
 
 # Logs
 logs/*

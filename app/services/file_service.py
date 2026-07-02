@@ -170,7 +170,7 @@ async def save_upload_file(file: UploadFile) -> DocumentUploadResponse:
                     output_file.close()
                     temp_upload_path.unlink(missing_ok=True)
                     raise HTTPException(
-                        status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                         detail="Dosya boyutu izin verilen limiti asiyor.",
                     )
                 sha256.update(chunk)

@@ -10,11 +10,14 @@ import requests
 import streamlit as st
 
 REQUEST_TIMEOUT_SECONDS = 10
+PROCESS_REQUEST_TIMEOUT_SECONDS = 300
 DEFAULT_BACKEND_BASE_URL = "http://localhost:8000"
 DEFAULT_CHAT_MODEL = "qwen3:4b"
 DEFAULT_EMBEDDING_MODEL = "qwen3-embedding:0.6b"
 SUPPORTED_FILE_TYPES = ["pdf", "jpg", "jpeg", "png"]
 UPLOADED_DOCUMENTS_KEY = "uploaded_documents"
+PROCESSED_DOCUMENTS_KEY = "processed_documents"
+TEXT_PREVIEW_LIMIT = 1000
 
 
 def read_dotenv() -> dict[str, str]:
@@ -92,6 +95,25 @@ def upload_document(backend_base_url: str, file) -> tuple[dict[str, Any] | None,
         return None, f"Backend'e erisilemiyor: {exc}"
 
 
+def process_uploaded_document(
+    backend_base_url: str,
+    document_id: str,
+    force: bool = False,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Process an uploaded document by id through the backend."""
+    try:
+        response = requests.post(
+            f"{backend_base_url}/api/v1/documents/{document_id}/process",
+            params={"force": "true"} if force else None,
+            timeout=PROCESS_REQUEST_TIMEOUT_SECONDS,
+        )
+        if response.ok:
+            return response.json(), None
+        return None, extract_error_message(response)
+    except requests.RequestException as exc:
+        return None, f"Backend'e erisilemiyor: {exc}"
+
+
 def upload_documents(
     backend_base_url: str,
     files: list[Any],
@@ -118,6 +140,8 @@ def initialize_session_state() -> None:
     """Initialize Streamlit session state keys used by the app."""
     if UPLOADED_DOCUMENTS_KEY not in st.session_state:
         st.session_state[UPLOADED_DOCUMENTS_KEY] = []
+    if PROCESSED_DOCUMENTS_KEY not in st.session_state:
+        st.session_state[PROCESSED_DOCUMENTS_KEY] = {}
 
 
 def remember_uploaded_document(document: dict[str, Any]) -> None:
@@ -201,7 +225,7 @@ def render_upload_area(backend_base_url: str) -> None:
 
         render_upload_results(results)
 
-    render_uploaded_documents()
+    render_uploaded_documents(backend_base_url)
 
 
 def render_selected_files(uploaded_files: list[Any]) -> None:
@@ -240,7 +264,7 @@ def render_upload_results(results: list[dict[str, Any]]) -> None:
         st.success(f"{filename}: belge yuklendi. document_id={payload.get('document_id')}")
 
 
-def render_uploaded_documents() -> None:
+def render_uploaded_documents(backend_base_url: str) -> None:
     """Render successfully uploaded documents stored in session state."""
     st.subheader("Yuklenen Belgeler")
     st.caption(
@@ -260,12 +284,140 @@ def render_uploaded_documents() -> None:
     for document in uploaded_documents:
         title = document.get("original_filename", "Belge")
         with st.expander(title, expanded=False):
-            st.write("Orijinal dosya adi:", document.get("original_filename"))
-            st.write("document_id:", document.get("document_id"))
-            st.write("MIME turu:", document.get("content_type"))
-            st.write("Boyut:", format_size(int(document.get("size_bytes", 0))))
-            st.write("Durum:", document.get("status"))
-            st.write("Olusturulma zamani:", document.get("created_at"))
+            render_uploaded_document_details(document)
+            render_processing_controls(backend_base_url, document)
+            render_processing_result(document)
+
+
+def render_uploaded_document_details(document: dict[str, Any]) -> None:
+    """Render stored upload metadata for one document."""
+    st.write("Orijinal dosya adi:", document.get("original_filename"))
+    st.write("document_id:", document.get("document_id"))
+    st.write("MIME turu:", document.get("content_type"))
+    st.write("Boyut:", format_size(int(document.get("size_bytes", 0))))
+    st.write("Durum:", document.get("status"))
+    st.write("Olusturulma zamani:", document.get("created_at"))
+
+
+def render_processing_controls(backend_base_url: str, document: dict[str, Any]) -> None:
+    """Render process and force reprocess buttons for one document."""
+    document_id = str(document.get("document_id", ""))
+    if not document_id:
+        st.warning("Belge kimligi bulunamadi.")
+        return
+
+    processed_documents = st.session_state[PROCESSED_DOCUMENTS_KEY]
+    is_processed = document_id in processed_documents
+    if is_processed:
+        st.success("Belge islendi.")
+    else:
+        st.info("Bu belge henuz islenmedi.")
+
+    process_col, reprocess_col = st.columns(2)
+    with process_col:
+        if st.button("Belgeyi Isle", key=f"process_{document_id}", disabled=is_processed):
+            process_document_from_ui(backend_base_url, document_id, force=False)
+    with reprocess_col:
+        if st.button("Yeniden Isle", key=f"reprocess_{document_id}"):
+            process_document_from_ui(backend_base_url, document_id, force=True)
+    st.caption("Yeniden Isle cache sonucunu atlar ve belgeyi tekrar isler.")
+
+
+def process_document_from_ui(
+    backend_base_url: str,
+    document_id: str,
+    force: bool,
+) -> None:
+    """Call the processing endpoint and store the result in session state."""
+    spinner_text = "Belge yeniden isleniyor..." if force else "Belge isleniyor..."
+    with st.spinner(spinner_text):
+        payload, error = process_uploaded_document(
+            backend_base_url,
+            document_id=document_id,
+            force=force,
+        )
+    if error is not None:
+        st.error(f"Belge islenemedi: {error}")
+        return
+    if payload is None:
+        st.error("Belge islenemedi: Beklenmeyen bir hata olustu.")
+        return
+
+    st.session_state[PROCESSED_DOCUMENTS_KEY][document_id] = payload
+    st.success("Belge isleme tamamlandi.")
+
+
+def render_processing_result(document: dict[str, Any]) -> None:
+    """Render cached processing result for a document if present."""
+    document_id = str(document.get("document_id", ""))
+    result = st.session_state[PROCESSED_DOCUMENTS_KEY].get(document_id)
+    if result is None:
+        return
+
+    st.divider()
+    st.subheader("Isleme Sonucu")
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Durum", str(result.get("processing_status", "bilinmiyor")))
+    metric_cols[1].metric("Sayfa", int(result.get("page_count", 0)))
+    metric_cols[2].metric("Karakter", int(result.get("total_character_count", 0)))
+    cache_label = "Evet" if result.get("from_cache") else "Hayir"
+    metric_cols[3].metric("Cache", cache_label)
+    st.write("Islenme zamani:", result.get("processed_at"))
+
+    render_page_previews(result.get("pages", []), document_id)
+
+
+def render_page_previews(pages: list[dict[str, Any]], document_id: str) -> None:
+    """Render page-level extraction previews."""
+    if not pages:
+        st.warning("Isleme sonucu sayfa bilgisi icermiyor.")
+        return
+
+    for page in pages:
+        page_number = page.get("page_number", "?")
+        method_label = format_extraction_method(str(page.get("extraction_method", "")))
+        title = f"Sayfa {page_number} - {method_label}"
+        with st.expander(title, expanded=False):
+            st.write("Sayfa numarasi:", page_number)
+            st.write("Extraction method:", method_label)
+            st.write("Karakter sayisi:", page.get("character_count", 0))
+            confidence = page.get("confidence")
+            if confidence is not None:
+                st.write("OCR confidence:", f"{float(confidence):.2f}")
+            warnings = page.get("warnings") or []
+            for warning in warnings:
+                st.warning(str(warning))
+
+            text = str(page.get("text") or "")
+            preview = text[:TEXT_PREVIEW_LIMIT]
+            if len(text) > TEXT_PREVIEW_LIMIT:
+                preview = f"{preview}\n\n..."
+            st.text_area(
+                "Ilk 1000 karakter",
+                value=preview,
+                height=180,
+                disabled=True,
+                key=f"preview_{document_id}_{page_number}",
+            )
+            if len(text) > TEXT_PREVIEW_LIMIT:
+                with st.expander("Metnin tamami", expanded=False):
+                    st.text_area(
+                        "Tam metin",
+                        value=text,
+                        height=300,
+                        disabled=True,
+                        key=f"full_text_{document_id}_{page_number}",
+                    )
+
+
+def format_extraction_method(extraction_method: str) -> str:
+    """Return a user-facing extraction method label."""
+    labels = {
+        "native_pdf": "Native PDF",
+        "ocr": "OCR",
+        "ocr_pdf": "PDF OCR",
+    }
+    return labels.get(extraction_method, extraction_method or "bilinmiyor")
 
 
 def main() -> None:
