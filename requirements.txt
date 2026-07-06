@@ -16,6 +16,7 @@ charset-normalizer==3.4.7
 click==8.4.2
 colorama==0.4.6
 colorlog==6.10.1
+chromadb==1.5.9
 crc32c==2.8
 fastapi==0.139.0
 filelock==3.29.4

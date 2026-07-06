@@ -14,6 +14,7 @@ venv/
 data/uploads/*
 !data/uploads/.gitkeep
 data/processed/*
+data/indexed/*
 data/chroma/*
 !data/chroma/.gitkeep
 tests/.tmp_uploads/
@@ -21,6 +22,8 @@ tests/.tmp_pytest/
 tests/tmp_pytest/
 tests/tmp_uploads/
 tests/tmp_pdfs/
+tests/generated_chroma/
+tests/tmp_indexing/
 
 # Logs
 logs/*

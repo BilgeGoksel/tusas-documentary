@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -11,12 +12,19 @@ import streamlit as st
 
 REQUEST_TIMEOUT_SECONDS = 10
 PROCESS_REQUEST_TIMEOUT_SECONDS = 300
+QA_REQUEST_TIMEOUT_SECONDS = 180
 DEFAULT_BACKEND_BASE_URL = "http://localhost:8000"
 DEFAULT_CHAT_MODEL = "qwen3:4b"
 DEFAULT_EMBEDDING_MODEL = "qwen3-embedding:0.6b"
 SUPPORTED_FILE_TYPES = ["pdf", "jpg", "jpeg", "png"]
 UPLOADED_DOCUMENTS_KEY = "uploaded_documents"
 PROCESSED_DOCUMENTS_KEY = "processed_documents"
+INDEXED_DOCUMENTS_KEY = "indexed_documents"
+PREPARED_DOCUMENTS_KEY = "prepared_documents"
+CHAT_HISTORY_KEY = "qa_chat_history"
+SELECTED_DOCUMENT_IDS_KEY = "qa_selected_document_ids"
+QA_SELECTION_INITIALIZED_KEY = "qa_selection_initialized"
+QA_TOP_K_KEY = "qa_top_k"
 TEXT_PREVIEW_LIMIT = 1000
 
 
@@ -56,8 +64,8 @@ def get_health_status(backend_base_url: str) -> tuple[dict[str, Any] | None, str
         if response.ok:
             return response.json(), None
         return None, extract_error_message(response)
-    except requests.RequestException as exc:
-        return None, f"Backend'e erisilemiyor: {exc}"
+    except requests.RequestException:
+        return None, "Backend'e erisilemiyor."
 
 
 def extract_error_message(response: requests.Response) -> str:
@@ -91,8 +99,8 @@ def upload_document(backend_base_url: str, file) -> tuple[dict[str, Any] | None,
         if response.ok:
             return response.json(), None
         return None, extract_error_message(response)
-    except requests.RequestException as exc:
-        return None, f"Backend'e erisilemiyor: {exc}"
+    except requests.RequestException:
+        return None, "Backend'e erisilemiyor."
 
 
 def process_uploaded_document(
@@ -110,8 +118,165 @@ def process_uploaded_document(
         if response.ok:
             return response.json(), None
         return None, extract_error_message(response)
-    except requests.RequestException as exc:
-        return None, f"Backend'e erisilemiyor: {exc}"
+    except requests.RequestException:
+        return None, "Backend'e erisilemiyor."
+
+
+def index_processed_document(
+    backend_base_url: str,
+    document_id: str,
+    force: bool = False,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Index a processed document through the backend."""
+    try:
+        response = requests.post(
+            f"{backend_base_url}/api/v1/documents/{document_id}/index",
+            params={"force": "true"} if force else None,
+            timeout=PROCESS_REQUEST_TIMEOUT_SECONDS,
+        )
+        if response.ok:
+            return response.json(), None
+        return None, extract_error_message(response)
+    except requests.RequestException:
+        return None, "Backend'e erisilemiyor."
+    except ValueError:
+        return None, "Backend gecersiz bir yanit dondurdu."
+
+
+def ask_qa(
+    backend_base_url: str,
+    query: str,
+    document_ids: list[str],
+    top_k: int,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Send a grounded question to the backend QA endpoint."""
+    try:
+        response = requests.post(
+            f"{backend_base_url}/api/v1/qa",
+            json={
+                "query": query,
+                "document_ids": document_ids,
+                "top_k": top_k,
+            },
+            timeout=QA_REQUEST_TIMEOUT_SECONDS,
+        )
+        if response.ok:
+            return response.json(), None
+        return None, extract_error_message(response)
+    except requests.RequestException:
+        return None, "Backend'e erisilemiyor."
+    except ValueError:
+        return None, "Backend gecersiz bir yanit dondurdu."
+
+
+def process_document(
+    backend_base_url: str,
+    document_id: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Process an uploaded document using the standard cached flow."""
+    return process_uploaded_document(backend_base_url, document_id, force=False)
+
+
+def index_document(
+    backend_base_url: str,
+    document_id: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Make a processed document searchable using the standard cached flow."""
+    return index_processed_document(backend_base_url, document_id, force=False)
+
+
+def ask_question(
+    backend_base_url: str,
+    query: str,
+    document_ids: list[str],
+    top_k: int,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Ask a grounded question about prepared documents."""
+    return ask_qa(backend_base_url, query, document_ids, top_k)
+
+
+def prepare_document_pipeline(
+    backend_base_url: str,
+    file: Any,
+    on_step: Callable[[str, str, float], None] | None = None,
+) -> dict[str, Any]:
+    """Upload, process and prepare one document while preserving stage errors."""
+    _report_pipeline_step(on_step, "upload", "Belge yükleniyor...", 0.10)
+    upload_payload, error = upload_document(backend_base_url, file)
+    if error is not None or upload_payload is None:
+        return _pipeline_failure(file.name, "upload", error)
+
+    document_id = str(upload_payload.get("document_id", ""))
+    if not document_id:
+        return _pipeline_failure(file.name, "upload", "Belge kimliği alınamadı.")
+
+    _report_pipeline_step(
+        on_step,
+        "process",
+        "Metin çıkarılıyor / OCR uygulanıyor...",
+        0.45,
+    )
+    process_payload, error = process_document(backend_base_url, document_id)
+    if error is not None or process_payload is None:
+        return _pipeline_failure(file.name, "process", error, document_id)
+
+    _report_pipeline_step(
+        on_step,
+        "index",
+        "Belge aranabilir hale getiriliyor...",
+        0.75,
+    )
+    index_payload, error = index_document(backend_base_url, document_id)
+    if error is not None or index_payload is None:
+        return _pipeline_failure(file.name, "index", error, document_id)
+
+    _report_pipeline_step(on_step, "ready", "Hazır.", 1.0)
+    return {
+        "prepared": True,
+        "document_id": document_id,
+        "original_filename": str(
+            index_payload.get("original_filename")
+            or upload_payload.get("original_filename")
+            or file.name
+        ),
+        "upload_status": str(upload_payload.get("status", "uploaded")),
+        "processing_status": str(
+            process_payload.get("processing_status", "processed")
+        ),
+        "indexing_status": str(index_payload.get("indexing_status", "indexed")),
+        "page_count": int(process_payload.get("page_count", 0)),
+        "chunk_count": int(index_payload.get("chunk_count", 0)),
+        "prepared_at": datetime.now(timezone.utc).isoformat(),
+        "from_cache": bool(
+            process_payload.get("from_cache") or index_payload.get("from_cache")
+        ),
+        "indexed_at": index_payload.get("indexed_at"),
+    }
+
+
+def _report_pipeline_step(
+    callback: Callable[[str, str, float], None] | None,
+    stage: str,
+    message: str,
+    progress: float,
+) -> None:
+    if callback is not None:
+        callback(stage, message, progress)
+
+
+def _pipeline_failure(
+    filename: str,
+    stage: str,
+    error: str | None,
+    document_id: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "prepared": False,
+        "original_filename": filename,
+        "document_id": document_id,
+        "failed_stage": stage,
+        "error": error or "Beklenmeyen bir hata oluştu.",
+    }
 
 
 def upload_documents(
@@ -142,6 +307,16 @@ def initialize_session_state() -> None:
         st.session_state[UPLOADED_DOCUMENTS_KEY] = []
     if PROCESSED_DOCUMENTS_KEY not in st.session_state:
         st.session_state[PROCESSED_DOCUMENTS_KEY] = {}
+    if INDEXED_DOCUMENTS_KEY not in st.session_state:
+        st.session_state[INDEXED_DOCUMENTS_KEY] = {}
+    if PREPARED_DOCUMENTS_KEY not in st.session_state:
+        st.session_state[PREPARED_DOCUMENTS_KEY] = {}
+    if CHAT_HISTORY_KEY not in st.session_state:
+        st.session_state[CHAT_HISTORY_KEY] = []
+    if SELECTED_DOCUMENT_IDS_KEY not in st.session_state:
+        st.session_state[SELECTED_DOCUMENT_IDS_KEY] = []
+    if QA_SELECTION_INITIALIZED_KEY not in st.session_state:
+        st.session_state[QA_SELECTION_INITIALIZED_KEY] = False
 
 
 def remember_uploaded_document(document: dict[str, Any]) -> None:
@@ -192,40 +367,108 @@ def render_sidebar(dotenv_values: dict[str, str], backend_base_url: str) -> None
         "Embedding:",
         get_setting("OLLAMA_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL, dotenv_values),
     )
+    st.sidebar.header("Soru-Cevap")
+    st.sidebar.slider(
+        "Getirilecek kaynak sayisi",
+        min_value=1,
+        max_value=10,
+        value=5,
+        key=QA_TOP_K_KEY,
+    )
 
 
 def render_upload_area(backend_base_url: str) -> None:
-    """Render the document upload controls."""
+    """Render the one-click document preparation workflow."""
+    st.header("1. Belge Yükle ve Hazırla")
     uploaded_files = st.file_uploader(
-        "Belgeleri sec",
+        "Belgeleri seç",
         type=SUPPORTED_FILE_TYPES,
         accept_multiple_files=True,
     )
 
     render_selected_files(uploaded_files)
 
-    if st.button("Secili Belgeleri Yukle", type="primary"):
+    if st.button("Belgeleri Yükle ve Hazırla", type="primary"):
         if not uploaded_files:
-            st.warning("Lutfen yuklemek icin en az bir belge secin.")
+            st.warning("Lütfen hazırlamak için en az bir belge seçin.")
             return
 
-        with st.spinner("Secili belgeler yukleniyor..."):
-            progress_bar = st.progress(0)
-            results = upload_documents(
+        for file in uploaded_files:
+            status_box = st.status(
+                f"{file.name} hazırlanıyor...",
+                expanded=True,
+            )
+            progress_bar = status_box.progress(0)
+
+            def update_step(stage: str, message: str, progress: float) -> None:
+                del stage
+                status_box.write(message)
+                progress_bar.progress(progress)
+
+            result = prepare_document_pipeline(
                 backend_base_url,
-                uploaded_files,
-                on_progress=lambda current, total: progress_bar.progress(current / total),
+                file,
+                on_step=update_step,
+            )
+            if result.get("prepared") is True:
+                remember_prepared_document(result)
+                status_box.update(
+                    label=f"{file.name} — Hazır.",
+                    state="complete",
+                    expanded=False,
+                )
+                continue
+
+            stage_labels = {
+                "upload": "Belge yüklenemedi",
+                "process": "Metin çıkarılamadı veya OCR tamamlanamadı",
+                "index": "Belge aranabilir hale getirilemedi",
+            }
+            stage_label = stage_labels.get(
+                str(result.get("failed_stage")), "Belge hazırlanamadı"
+            )
+            status_box.write(f"{stage_label}: {result.get('error')}")
+            status_box.update(
+                label=f"{file.name} — Hazırlanamadı.",
+                state="error",
+                expanded=True,
             )
 
-        for result in results:
-            payload = result["payload"]
-            error = result["error"]
-            if payload is not None and error is None:
-                remember_uploaded_document(payload)
+    render_prepared_documents()
 
-        render_upload_results(results)
 
-    render_uploaded_documents(backend_base_url)
+def remember_prepared_document(document: dict[str, Any]) -> None:
+    """Store one prepared document without duplicating its document id."""
+    document_id = str(document.get("document_id", ""))
+    if not document_id:
+        return
+    prepared_documents = st.session_state[PREPARED_DOCUMENTS_KEY]
+    existing_ids = set(prepared_documents)
+    selected_ids = set(st.session_state[SELECTED_DOCUMENT_IDS_KEY])
+    selected_all_existing = bool(existing_ids) and selected_ids == existing_ids
+    prepared_documents[document_id] = document
+    if selected_all_existing and document_id not in selected_ids:
+        st.session_state[SELECTED_DOCUMENT_IDS_KEY].append(document_id)
+
+
+def render_prepared_documents() -> None:
+    """Render user-friendly prepared documents with optional technical details."""
+    st.header("2. Hazır Belgeler")
+    prepared_documents = st.session_state[PREPARED_DOCUMENTS_KEY]
+    if not prepared_documents:
+        st.info("Henüz soru sormaya hazır bir belge yok.")
+        return
+
+    for document in prepared_documents.values():
+        filename = str(document.get("original_filename", "Belge"))
+        st.success(f"✓ {filename} — Soru sormaya hazır")
+        with st.expander(f"{filename} teknik detayları", expanded=False):
+            st.write("document_id:", document.get("document_id"))
+            st.write("page_count:", document.get("page_count", 0))
+            st.write("chunk_count:", document.get("chunk_count", 0))
+            st.write("from_cache:", document.get("from_cache", False))
+            st.write("indexed_at:", document.get("indexed_at"))
+            st.write("prepared_at:", document.get("prepared_at"))
 
 
 def render_selected_files(uploaded_files: list[Any]) -> None:
@@ -321,6 +564,64 @@ def render_processing_controls(backend_base_url: str, document: dict[str, Any]) 
         if st.button("Yeniden Isle", key=f"reprocess_{document_id}"):
             process_document_from_ui(backend_base_url, document_id, force=True)
     st.caption("Yeniden Isle cache sonucunu atlar ve belgeyi tekrar isler.")
+
+    if is_processed:
+        render_indexing_controls(backend_base_url, document)
+
+
+def render_indexing_controls(
+    backend_base_url: str,
+    document: dict[str, Any],
+) -> None:
+    """Render indexing controls for one processed document."""
+    document_id = str(document.get("document_id", ""))
+    indexed_documents = st.session_state[INDEXED_DOCUMENTS_KEY]
+    is_indexed = document_id in indexed_documents
+    if is_indexed:
+        st.success("Belge indexlendi ve soru-cevap icin hazir.")
+    else:
+        st.info("Belge henuz indexlenmedi.")
+
+    index_col, reindex_col = st.columns(2)
+    with index_col:
+        if st.button(
+            "Belgeyi Indexle",
+            key=f"index_{document_id}",
+            disabled=is_indexed,
+        ):
+            index_document_from_ui(backend_base_url, document, force=False)
+    with reindex_col:
+        if st.button("Yeniden Indexle", key=f"reindex_{document_id}"):
+            index_document_from_ui(backend_base_url, document, force=True)
+
+
+def index_document_from_ui(
+    backend_base_url: str,
+    document: dict[str, Any],
+    force: bool,
+) -> None:
+    """Call the indexing endpoint and remember successful index metadata."""
+    document_id = str(document.get("document_id", ""))
+    spinner_text = "Belge yeniden indexleniyor..." if force else "Belge indexleniyor..."
+    with st.spinner(spinner_text):
+        payload, error = index_processed_document(
+            backend_base_url,
+            document_id=document_id,
+            force=force,
+        )
+    if error is not None:
+        st.error(f"Belge indexlenemedi: {error}")
+        return
+    if payload is None:
+        st.error("Belge indexlenemedi: Beklenmeyen bir hata olustu.")
+        return
+
+    indexed_record = dict(payload)
+    indexed_record["original_filename"] = document.get(
+        "original_filename", payload.get("original_filename", "Belge")
+    )
+    st.session_state[INDEXED_DOCUMENTS_KEY][document_id] = indexed_record
+    st.success("Belge indexleme tamamlandi.")
 
 
 def process_document_from_ui(
@@ -420,6 +721,122 @@ def format_extraction_method(extraction_method: str) -> str:
     return labels.get(extraction_method, extraction_method or "bilinmiyor")
 
 
+def render_qa_area(backend_base_url: str) -> None:
+    """Render prepared-document selection and persistent QA chat history."""
+    st.divider()
+    st.header("3. Belgelere Soru Sor")
+
+    if st.button("Sohbeti Temizle", key="clear_qa_chat"):
+        st.session_state[CHAT_HISTORY_KEY] = []
+        st.success("Sohbet gecmisi temizlendi.")
+
+    prepared_documents = st.session_state[PREPARED_DOCUMENTS_KEY]
+    if not prepared_documents:
+        st.info(
+            "Soru-cevap alanını kullanmak için önce bir belgeyi hazırlayın."
+        )
+        render_chat_history()
+        return
+
+    available_ids = list(prepared_documents)
+    if not st.session_state[QA_SELECTION_INITIALIZED_KEY]:
+        st.session_state[SELECTED_DOCUMENT_IDS_KEY] = available_ids
+        st.session_state[QA_SELECTION_INITIALIZED_KEY] = True
+    valid_selection = [
+        document_id
+        for document_id in st.session_state[SELECTED_DOCUMENT_IDS_KEY]
+        if document_id in prepared_documents
+    ]
+    st.session_state[SELECTED_DOCUMENT_IDS_KEY] = valid_selection
+    selected_ids = st.multiselect(
+        "Soru sorulacak belgeler",
+        options=available_ids,
+        format_func=lambda document_id: str(
+            prepared_documents[document_id].get("original_filename", "Belge")
+        ),
+        key=SELECTED_DOCUMENT_IDS_KEY,
+        help="Varsayılan olarak tüm hazır belgelerde arama yapılır.",
+    )
+
+    render_chat_history()
+    query = st.chat_input("Belgeleriniz hakkinda bir soru sorun")
+    if query is None:
+        return
+    if not selected_ids:
+        st.warning("Soru sormak için en az bir hazır belge seçin.")
+        return
+
+    with st.chat_message("user"):
+        st.markdown(query)
+    with st.spinner("Belgelerde yanit araniyor..."):
+        payload, error = ask_question(
+            backend_base_url,
+            query=query,
+            document_ids=list(selected_ids),
+            top_k=int(st.session_state.get(QA_TOP_K_KEY, 5)),
+        )
+    if error is not None:
+        with st.chat_message("assistant"):
+            st.error(error)
+        return
+    if payload is None:
+        with st.chat_message("assistant"):
+            st.error("Cevap alinamadi: Beklenmeyen bir hata olustu.")
+        return
+
+    exchange = {
+        "query": query,
+        "answer": str(payload.get("answer", "")),
+        "sources": payload.get("sources") or [],
+        "document_ids": list(selected_ids),
+        "found_in_documents": bool(payload.get("found_in_documents")),
+        "retrieved_chunk_count": int(payload.get("retrieved_chunk_count", 0)),
+        "model": str(payload.get("model", "")),
+        "top_k": int(payload.get("top_k", st.session_state.get(QA_TOP_K_KEY, 5))),
+    }
+    st.session_state[CHAT_HISTORY_KEY].append(exchange)
+    render_assistant_exchange(exchange)
+
+
+def render_chat_history() -> None:
+    """Render all stored question-answer exchanges in chronological order."""
+    for exchange in st.session_state[CHAT_HISTORY_KEY]:
+        with st.chat_message("user"):
+            st.markdown(str(exchange.get("query", "")))
+        render_assistant_exchange(exchange)
+
+
+def render_assistant_exchange(exchange: dict[str, Any]) -> None:
+    """Render one assistant answer and its user-facing source details."""
+    with st.chat_message("assistant"):
+        answer = str(exchange.get("answer", ""))
+        if exchange.get("found_in_documents") is False:
+            st.warning(answer)
+        else:
+            st.markdown(answer)
+        render_sources(exchange.get("sources") or [])
+
+
+def render_sources(sources: list[dict[str, Any]]) -> None:
+    """Render source metadata without exposing internal document identifiers."""
+    if not sources:
+        return
+    with st.expander("Kaynaklar", expanded=False):
+        for source in sources:
+            source_number = source.get("source_number", "?")
+            st.markdown(
+                f"**[{source_number}] {source.get('original_filename', 'Belge')}**"
+            )
+            st.write("Sayfa:", source.get("page_number", "?"))
+            score = source.get("similarity_score")
+            if isinstance(score, (int, float)):
+                st.write("Benzerlik skoru:", f"{float(score):.3f}")
+            snippet = str(source.get("snippet") or "").strip()
+            if snippet:
+                st.caption(snippet)
+            st.divider()
+
+
 def main() -> None:
     """Render the Streamlit application."""
     st.set_page_config(
@@ -435,6 +852,7 @@ def main() -> None:
 
     render_sidebar(dotenv_values, backend_base_url)
     render_upload_area(backend_base_url)
+    render_qa_area(backend_base_url)
 
 
 if __name__ == "__main__":
