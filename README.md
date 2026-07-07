@@ -407,7 +407,7 @@ Sistem aşağıdaki belge ve soru tipleriyle test edilmiştir:
 - Uzun ders notu PDF'i
 - CV PDF'i
 - Grafik PNG dosyası
-- Türkçe ve İngilizce içeren örnek soru ekran görüntüsü
+- Türkçe ve İngilizce içeren örnek test sorusu ekran görüntüsü
 - Belgede olmayan bilgi soruları
 - Çoklu belge seçimi
 - OCR tabanlı belgeler
@@ -453,24 +453,6 @@ Bu dosyada özellikle şu konular anlatılmıştır:
 - Kullanıcı belgeleri harici servislere gönderilmez.
 - API anahtarına ihtiyaç yoktur.
 - `.env`, yüklenen belgeler, ChromaDB verileri ve log dosyaları Git'e eklenmez.
-
----
-
-## Git'e Eklenmemesi Gerekenler
-
-Aşağıdaki dosya ve klasörler `.gitignore` içinde tutulmalıdır:
-
-```text
-.env
-.venv/
-data/uploads/
-data/processed/
-data/indexed/
-data/chroma/
-logs/
-__pycache__/
-.pytest_cache/
-```
 
 ---
 
